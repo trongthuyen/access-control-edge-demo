@@ -272,6 +272,163 @@ Kết quả mong đợi nếu UID được liên kết với device:
 }
 ```
 
+## Tích hợp K6 cloud (README.cloud.md)
+
+Edge có thể đẩy dữ liệu lên platform **NEXUS K6** (`README.cloud.md`) qua
+MQTT. Edge đứng vai trò **gateway**: đăng ký STM32 + các device thành phần
+lên K6 (REST) rồi publish telemetry lên broker của K6.
+
+```text
+STM32/MFRC522/servo/LEDs/buzzer ── UART/HTTP ──► Edge (server.py)
+                                                  ├─ REST  : đăng ký device + token (POST /api/devices, provision:true)
+                                                  └─ MQTT  : k6/{projectId}/{deviceId}/telemetry + /status
+```
+
+### Flow 1 — Register devices (lần đầu serial link UP)
+
+```mermaid
+flowchart TD
+    A[Serial mở cổng COM thành công] --> B["set_link(True, device_id)"]
+    B --> C{Fleet đã đăng ký<br/>trên K6 chưa?}
+    C -- đã có trong registry --> S[set_link: status = online cho cả fleet]
+    C -- chưa --> D[REST: login operator<br/>POST /api/auth/login<br/>→ bearer token]
+    D --> E[REST: POST /api/devices<br/>provision: true, idempotent]
+
+    subgraph FLEET [6 device cho mỗi STM32]
+        direction TB
+        E1[STM32 421108000003<br/>Industrial Controller<br/>5122000001]
+        E2[MFRC522<br/>Card Reader 4211000008 (actuator)<br/>parent = STM32]
+        E3[Servo<br/>Servo Motor 4211000006<br/>parent = STM32]
+        E4[Green LED<br/>Smart LED 4211000001<br/>parent = STM32]
+        E5[Red LED<br/>Smart LED 4211000001<br/>parent = STM32]
+        E6[Buzzer<br/>Smart Switch 4211000002<br/>parent = STM32]
+    end
+
+    E --> E1 --> E2 --> E3 --> E4 --> E5 --> E6
+
+    E1 & E2 & E3 & E4 & E5 & E6 --> F{HTTP response?}
+    F -- 201 --> G[save token vào cloud_credentials.json]
+    F -- 409 --> H[dùng token cache hoặc rotate token]
+    G --> I[MQTT connect tới K6 broker]
+    H --> I
+    I --> J[MQTT publish status = online, retained cho 6 topics]
+    J --> S
+```
+
+### Flow 2 — Send data sau decision (GRANT / DENY)
+
+```mermaid
+flowchart TD
+    A[Có thẻ quẹt<br/>MFRC522 đọc uid] --> B{Kênh vào?}
+    B -- Serial --> C[STM32 gửi RFID:id,uid<br/>qua USB-UART]
+    B -- HTTP --> D[ESP32 POST<br/>/api/devices/ID/verify]
+    C --> E[verify_access: override device_id = STM32_DEVICE_ID]
+    D --> E
+    E --> F[db.check_access: SQLite device / rfid / link]
+    F --> G{Kết quả?}
+    G -- ok --> H[GRANT: HTTP 200 / Serial GRANT]
+    G -- khác --> I[DENY: HTTP 401 / Serial DENY]
+    H --> J[log_access: audit CSV]
+    I --> J
+    J --> K[cloud.on_decision: publish ngay, qos 1]
+    K --> R{Timer reset 5s hết?}
+    R -- yes --> S[reset: servo về 0, tắt mọi LED + buzzer, report lên K6]
+
+    K --> L1[MFRC522 telemetry: metrics.tagId = uid]
+    K --> L2[servo telemetry: metrics.position, GRANT = 90 / DENY = 0]
+    K --> L3[green_led telemetry: metrics.power = true khi GRANT]
+    K --> L4[red_led telemetry: metrics.power = true khi DENY]
+    K --> L5[buzzer telemetry: metrics.power = true khi DENY]
+    L1 & L2 & L3 & L4 & L5 --> M[K6: live state + InfluxDB history]
+
+    H --> N[STM32 mở barrier]
+    I --> O[STM32 khoá + buzzer]
+```
+
+### Flow 3 — Health heartbeat (mỗi 2 phút)
+
+```mermaid
+flowchart LR
+    T[thread cloud-health, mỗi 120s] --> P[STM32 telemetry: wifiSignalStrength]
+    T --> P2[MFRC522 telemetry: wifiSignal + data gần nhất]
+    T --> P3[servo telemetry]
+    T --> P4[green_led telemetry]
+    T --> P5[red_led telemetry]
+    T --> P6[buzzer telemetry]
+    P & P2 & P3 & P4 & P5 & P6 --> Q[K6: vắng hơn 10 phút mới offline]
+```
+
+ Fleet được đăng ký trên K6 cho mỗi STM32 (device id 12-hex theo quy ước
+ K6): STM32 là `Industrial Controller` (`5122000001`), các thành phần là
+ device con (parent = STM32):
+
+| Thành phần | K6 device type | Data capabilities |
+| ---------- | -------------- | ----------------- |
+| MFRC522    | `4211000008` Card Reader (actuator) | `tagId` |
+| Servo      | `4211000006` Servo Motor | `position` (0 = Đóng, 90 = Mở) |
+| Green LED  | `4211000001` Smart LED   | `power` |
+| Red LED    | `4211000001` Smart LED   | `power` |
+| Buzzer     | `4211000002` Smart Switch| `power` |
+
+### Trạng thái actuators theo decision (auto-reset 5s)
+
+| Decision | Servo | Green LED | Red LED | Buzzer |
+| -------- | ----- | --------- | ------- | ------ |
+| **accepted** (GRANT) | `position: 90` (mở) | `power: true` | `power: false` | `power: false` |
+| **denied** (DENY)    | `position: 0` (đóng) | `power: false` | `power: true` | `power: true` |
+| **reset sau 5s**     | `position: 0` | `power: false` | `power: false` | `power: false` |
+
+- Edge publish trạng thái decision lên K6 **ngay lập tức**, rồi **tự reset sau 5 giây** (`K6_ACTUATOR_RESET_SEC`, thread `threading.Timer`).
+- Quẹt thẻ liên tiếp trong khoảng reset: timer cũ bị hủy, timer mới bắt đầu — đúng hành vi thật của barrier.
+- `mfrc522.tagId` là event (không bị reset), luôn giữ uid quẹt cuối cùng.
+
+### Dữ liệu gửi lên
+
+- **Mỗi 2 phút** (health heartbeat): frame telemetry cho *mọi* device đã đăng
+  ký, gồm connection/network status (`wifiSignalStrength`) + trạng thái gần
+  nhất của component.
+- **Ngay sau mỗi decision** (HTTP hoặc serial):
+  - MFRC522: `metrics.tagId = <uid quẹt>`
+  - Servo: `metrics.position = 100` (mở barrier khi GRANT) / `0` (DENY)
+  - Green LED: `metrics.power = true` khi GRANT
+  - Red LED: `metrics.power = true` khi DENY
+  - Buzzer: `metrics.power = true` khi DENY
+- **Serial link up/down**: publish retained status `online`/`offline` cho cả
+  fleet (K6 sẽ đánh dấu device offline qua last-will/timeout).
+
+Device đã provisioned rồi thì dùng lại token cache trong
+`cloud_credentials.json` — provisioning là idempotent, chạy lại không mất token.
+
+> **Hardcode device_id STM32 (tạm thời)**: firmware STM32 hiện đang gửi
+> device_id khác chưa sửa được, nên `server.py` ghi đè mọi device_id từ MCU
+> bằng hằng `STM32_DEVICE_ID = "421108000003"` (khớp `seed.py`) ngay trong
+> `verify_access()` — áp dụng cho cả kênh HTTP và serial. Khi firmware đã sửa
+> đúng, xoá dòng override này.
+
+### Bật cloud
+
+```bash
+pip install -r requirements.txt            # thêm requests + paho-mqtt
+export K6_MQTT_URL=mqtt://127.0.0.1:1883
+export K6_API_URL=http://127.0.0.1:8080
+export K6_PROJECT_ID=<uuid project>        # lấy từ console K6
+python server.py --serial-port auto        # cloud tự bật khi có đủ biến
+```
+
+| Biến môi trường        | Mặc định                | Ý nghĩa                                  |
+| ---------------------- | ----------------------- | ---------------------------------------- |
+| `K6_ENABLED`           | `1`                     | `0` để tắt đẩy dữ liệu lên cloud          |
+| `K6_MQTT_URL`          | `mqtt://127.0.0.1:1883` | broker MQTT của K6                        |
+| `K6_API_URL`           | `http://127.0.0.1:8080` | REST API của K6 backend (provisioning)    |
+| `K6_PROJECT_ID`        | (bắt buộc khi bật)      | uuid project trên K6                      |
+| `K6_AUTH_EMAIL`        | `operator@nexus.local`  | operator dùng để provision device         |
+| `K6_AUTH_PASSWORD`     | `nexus`                 | mật khẩu operator                         |
+| `K6_HEALTH_INTERVAL_SEC`| `120`                  | chu kỳ health heartbeat (giây)            |
+| `K6_NETWORK_DBM`       | `-60`                   | giá trị network signal báo lên            |
+| `K6_CREDENTIALS_FILE`  | `cloud_credentials.json`| cache device token                        |
+
+Hoặc chạy kèm flag `--no-cloud` để tắt cloud cho phiên chạy hiện tại.
+
 ## Ghi chú bảo mật
 
 - Hiện tại edge không có xác thực request (dùng trong LAN nội bộ)

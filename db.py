@@ -26,6 +26,10 @@ from contextlib import contextmanager
 DB_PATH = os.path.join(os.path.dirname(__file__), 'data/db', "access_control.db")
 AUDIT_LOG_ROOT = os.path.join(os.path.dirname(__file__), 'data', 'log')
 
+# SQLite không tự tạo thư mục cha -> đảm bảo có sẵn trước khi mở file
+os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+os.makedirs(AUDIT_LOG_ROOT, exist_ok=True)
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS device (
     id       TEXT PRIMARY KEY,      -- mac address

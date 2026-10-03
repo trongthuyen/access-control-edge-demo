@@ -22,6 +22,9 @@ Cấu hình qua biến môi trường (đều có thể ghi đè bằng CLI):
     EDGE_HOST, EDGE_PORT, EDGE_SERIAL_PORT, EDGE_SERIAL_BAUD, EDGE_DEVICE_ID
 """
 
+from dotenv import load_dotenv
+load_dotenv()
+
 import argparse
 import os
 import sys
@@ -31,8 +34,12 @@ import time
 from flask import Flask, jsonify, request
 
 import db
+import cloud
 
 app = Flask(__name__)
+
+# Kết nối tới NEXUS K6 cloud (REST provisioning + MQTT telemetry).
+cloud_bridge = cloud.K6Cloud.from_env()
 
 DEFAULT_HTTP_HOST = "0.0.0.0"
 DEFAULT_HTTP_PORT = 5000
@@ -46,6 +53,15 @@ USB_UART_HINTS = (
     "FT232", "FTDI", "PL2303",            # các USB-UART khác
     "USB-SERIAL", "USB SERIAL", "USB TO UART",
 )
+
+# ---------------------------------------------------------------------------
+# Device ID của STM32 (HARDCODE tạm thời)
+# ---------------------------------------------------------------------------
+# Firmware STM32 hiện đang dùng device_id khác nên chưa sửa được: mọi device_id
+# gửi lên (HTTP lẫn serial) đều bị ghi đè bằng id chuẩn này, khớp với seed.py.
+# Vẫn có thể ghi đè bằng --device-id / EDGE_DEVICE_ID mà không cần chạy lại
+# firmware. Khi firmware đã sửa đúng, xoá phần override trong verify_access().
+STM32_DEVICE_ID = "421108000003"
 
 
 def _env(name, default=None):
@@ -74,7 +90,9 @@ def verify_access(device_id, rfid_uid, source="http"):
     Verify và ghi audit log. Trả về (result, reason, http_status).
     result: "granted" | "denied"
     """
-    device_id = str(device_id or "").strip()
+    raw_device_id = str(device_id or "").strip()
+    # HARDcode device_id STM32: firmware chưa sửa được nên bỏ qua id MCU gửi lên
+    device_id = STM32_DEVICE_ID
     rfid_uid = str(rfid_uid or "").strip()
 
     if not device_id or not rfid_uid:
@@ -89,7 +107,9 @@ def verify_access(device_id, rfid_uid, source="http"):
             result = "granted" if granted else "denied"
             status = 200 if granted else 401
 
-    print(f"[{source.upper()}] device={device_id or '-'} uid={rfid_uid or '-'} "
+    print(f"[{source.upper()}] device={device_id}"
+          f"{' (MCU gửi: ' + raw_device_id + ')' if raw_device_id and raw_device_id != device_id else ''} "
+          f"uid={rfid_uid or '-'} "
           f"-> {result} ({reason})")
 
     if device_id or rfid_uid:
@@ -97,6 +117,10 @@ def verify_access(device_id, rfid_uid, source="http"):
             db.log_access(device_id, rfid_uid, result=result, reason=reason)
         except Exception as exc:
             print(f"[{source.upper()}] lỗi ghi audit log: {exc}")
+
+    # Cloud: ngay sau khi xử lý decision xong, gửi access event lên K6
+    # (RFID + servo status + green/red LEDs status + buzzer status).
+    cloud_bridge.on_decision(device_id, rfid_uid, result, reason)
 
     return result, reason, status
 
@@ -324,10 +348,13 @@ def _serial_worker(port, baud, device_id, auto=False):
                     print(f"[SERIAL] CẢNH BÁO: {ser.port} là '{desc}', KHÔNG phải USB-UART "
                           f"(CP2102/CH340...). Chạy `python server.py --list-ports` "
                           f"rồi chọn đúng cổng (hoặc --serial-port auto).")
+                # Serial vừa nối lại -> đăng ký fleet với K6 (nếu chưa) + báo online.
+                cloud_bridge.set_link(True, device_id)
                 _serial_loop(ser, device_id)
         except Exception as exc:
             print(f"[SERIAL] lỗi trên {current_port}: {exc}")
 
+        cloud_bridge.set_link(False)
         time.sleep(SERIAL_RECONNECT_DELAY)
 
 
@@ -347,10 +374,12 @@ def build_parser():
                         help="cổng COM của USB-UART (CP2102/CH340): COM8 | /dev/ttyUSB0 | auto")
     parser.add_argument("--baud", type=int, default=int(_env("EDGE_SERIAL_BAUD", DEFAULT_SERIAL_BAUD)),
                         help=f"baudrate serial (mặc định {DEFAULT_SERIAL_BAUD}, phải khớp firmware STM32)")
-    parser.add_argument("--device-id", default=_env("EDGE_DEVICE_ID"),
-                        help="device_id mặc định cho kênh serial (ID của STM32)")
+    parser.add_argument("--device-id", default=_env("EDGE_DEVICE_ID", STM32_DEVICE_ID),
+                        help=f"device_id mặc định cho kênh serial (hardcode = {STM32_DEVICE_ID})")
     parser.add_argument("--list-ports", action="store_true",
                         help="liệt kê cổng COM đang có rồi thoát")
+    parser.add_argument("--no-cloud", action="store_true",
+                        help="tắt đẩy dữ liệu lên K6 cloud")
     return parser
 
 
@@ -362,6 +391,7 @@ def main(argv=None):
         return 0
 
     db.init_db()
+    cloud_bridge.start(disabled=args.no_cloud)
 
     if args.serial_port:
         auto = args.serial_port.strip().lower() == "auto"

@@ -1,2 +1,5 @@
 flask
 pyserial
+requests
+paho-mqtt
+python-dotenv
